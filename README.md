@@ -48,30 +48,3 @@ can also be disabled:
 dynamic_detection_regions(circuit, autoplay=False, loop=False)
 ```
 
-## What is exact
-
-At every non-terminal integer **diagram tick** `k`, the player mounts
-`circuit.diagram("detslice-with-ops-svg", tick=k)` verbatim. The terminal tick
-uses the equivalent private-copy workaround described below. Stim's combined
-diagram shows the operations in window `k` and the detector slice after those
-operations, at boundary `k+1`. This preserves Stim's detector shapes, colors,
-gradients, gates, qubit layout, dots, and labels. Between integer diagram ticks,
-only matching detector regions are interpolated; this motion is a geometric
-visualization, not additional circuit simulation.
-
-The compiler does no raster rendering or frame-rate-dependent precomputation,
-and it makes no periodicity assumptions. The browser interpolates paths at
-display time.
-
-The compact notebook view uses a loopback-only memory URL, so the browser and
-Python kernel should be on the same computer. If a notebook forbids that local
-socket, the helper falls back to a fully inline `srcdoc` iframe. `str(animation)`
-always returns the complete self-contained HTML document.
-
-Requires Python 3.10+, Stim 1.15 or 1.16, and NumPy. These Stim versions can
-stall while drawing the terminal diagram tick of particular circuits. At
-`tick=circuit.num_ticks` only, this package renders a private copy with one
-empty trailing `TICK`. It does not mutate the input circuit or change its state.
-The copied-circuit SVG is byte-for-byte equal to direct terminal output for the
-regression fixtures; this is a compatibility workaround, not a claim about
-untested Stim versions.
