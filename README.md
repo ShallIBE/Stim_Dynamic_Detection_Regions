@@ -13,10 +13,8 @@ from dynamic_detection_regions import dynamic_detection_regions
 dynamic_detection_regions(circuit)
 ```
 
-That is it. The animation appears in the cell and stays in memory. No HTML file
-is created.
 
-Saving is optional:
+To optionally Save:
 
 ```python
 animation = dynamic_detection_regions(circuit)
@@ -24,3 +22,4 @@ animation.save("animation.html")
 ```
 
 Requires Python with `stim` and `numpy` installed.
+Use your preferred method to optionally convert to MP4, GIF, etc
