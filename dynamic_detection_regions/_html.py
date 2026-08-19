@@ -26,7 +26,7 @@ HTML_HEAD = """<!doctype html>
     #stage svg { display: block; width: 100%; height: 100%; }
     #controls {
       display: grid;
-      grid-template-columns: auto 1fr auto;
+      grid-template-columns: auto auto 1fr auto;
       gap: 10px;
       align-items: center;
       padding: 12px max(12px, env(safe-area-inset-right))
@@ -50,6 +50,7 @@ HTML_HEAD = """<!doctype html>
   <div id="stage"></div>
   <div id="controls">
     <button id="play">Play</button>
+    <button id="save-gif">Save GIF</button>
     <input id="seek" type="range" min="0" step="0.001">
     <span id="tick"></span>
   </div>
@@ -71,6 +72,7 @@ const stage = document.getElementById('stage');
 const seek = document.getElementById('seek');
 const tickLabel = document.getElementById('tick');
 const playButton = document.getElementById('play');
+const gifButton = document.getElementById('save-gif');
 const intervalCount = data.ticks.length - 1;
 
 seek.max = String(intervalCount);
@@ -371,6 +373,367 @@ function show(nextPosition) {
   tickLabel.textContent = `diagram tick ${(data.startTick + position).toFixed(3)}`;
 }
 
+class ByteWriter {
+  constructor() {
+    this.chunks = [];
+    this.buffer = new Uint8Array(65536);
+    this.length = 0;
+  }
+
+  byte(value) {
+    if (this.length === this.buffer.length) this.flush();
+    this.buffer[this.length++] = value;
+  }
+
+  word(value) {
+    this.byte(value & 255);
+    this.byte((value >>> 8) & 255);
+  }
+
+  bytes(values) {
+    let offset = 0;
+    while (offset < values.length) {
+      if (this.length === this.buffer.length) this.flush();
+      const count = Math.min(values.length - offset, this.buffer.length - this.length);
+      this.buffer.set(values.subarray(offset, offset + count), this.length);
+      this.length += count;
+      offset += count;
+    }
+  }
+
+  text(value) {
+    for (let index = 0; index < value.length; index++) this.byte(value.charCodeAt(index));
+  }
+
+  flush() {
+    if (!this.length) return;
+    this.chunks.push(this.buffer.slice(0, this.length));
+    this.length = 0;
+  }
+
+  blob() {
+    this.flush();
+    return new Blob(this.chunks, {type: 'image/gif'});
+  }
+}
+
+function gifPalette() {
+  const colors = [
+    [0, 0, 0],
+    [255, 255, 255],
+    [255, 64, 64],
+    [89, 255, 122],
+    [77, 166, 255],
+    [170, 170, 170],
+    [17, 17, 17],
+    [24, 24, 24],
+  ];
+  const levels = [0, 85, 170, 255];
+  for (const red of levels) {
+    for (const green of levels) {
+      for (const blue of levels) colors.push([red, green, blue]);
+    }
+  }
+  for (let index = 0; index < 55; index++) {
+    const value = Math.round(index * 255 / 54);
+    colors.push([value, value, value]);
+  }
+  colors.push([0, 0, 0]);
+  return new Uint8Array(colors.flat());
+}
+
+const GIF_PALETTE = gifPalette();
+const GIF_TRANSPARENT = 127;
+let gifLookup = null;
+
+function getGifLookup() {
+  if (gifLookup) return gifLookup;
+  gifLookup = new Uint8Array(32768);
+  for (let red = 0; red < 32; red++) {
+    for (let green = 0; green < 32; green++) {
+      for (let blue = 0; blue < 32; blue++) {
+        const actualRed = Math.min(255, red * 8 + 4);
+        const actualGreen = Math.min(255, green * 8 + 4);
+        const actualBlue = Math.min(255, blue * 8 + 4);
+        let best = 0;
+        let bestDistance = Infinity;
+        for (let index = 0; index < 127; index++) {
+          const offset = index * 3;
+          const deltaRed = actualRed - GIF_PALETTE[offset];
+          const deltaGreen = actualGreen - GIF_PALETTE[offset + 1];
+          const deltaBlue = actualBlue - GIF_PALETTE[offset + 2];
+          const distance = deltaRed * deltaRed + deltaGreen * deltaGreen + deltaBlue * deltaBlue;
+          if (distance < bestDistance) {
+            bestDistance = distance;
+            best = index;
+          }
+        }
+        gifLookup[(red << 10) | (green << 5) | blue] = best;
+      }
+    }
+  }
+  return gifLookup;
+}
+
+class GifEncoder {
+  constructor(width, height) {
+    this.width = width;
+    this.height = height;
+    this.writer = new ByteWriter();
+    this.writer.text('GIF89a');
+    this.writer.word(width);
+    this.writer.word(height);
+    this.writer.byte(0xf6);
+    this.writer.byte(1);
+    this.writer.byte(0);
+    this.writer.bytes(GIF_PALETTE);
+    this.writer.byte(0x21);
+    this.writer.byte(0xff);
+    this.writer.byte(11);
+    this.writer.text('NETSCAPE2.0');
+    this.writer.byte(3);
+    this.writer.byte(1);
+    this.writer.word(0);
+    this.writer.byte(0);
+  }
+
+  frame(pixels, left, top, width, height, delay) {
+    this.writer.byte(0x21);
+    this.writer.byte(0xf9);
+    this.writer.byte(4);
+    this.writer.byte(5);
+    this.writer.word(Math.max(1, Math.min(65535, delay)));
+    this.writer.byte(GIF_TRANSPARENT);
+    this.writer.byte(0);
+    this.writer.byte(0x2c);
+    this.writer.word(left);
+    this.writer.word(top);
+    this.writer.word(width);
+    this.writer.word(height);
+    this.writer.byte(0);
+    this.writePixels(pixels, left, top, width, height);
+  }
+
+  writePixels(pixels, left, top, width, height) {
+    const writer = this.writer;
+    const dictionary = new Map();
+    const clearCode = 128;
+    const endCode = 129;
+    let nextCode = 130;
+    let codeSize = 8;
+    let bitBuffer = 0;
+    let bitCount = 0;
+    const block = new Uint8Array(255);
+    let blockLength = 0;
+
+    writer.byte(7);
+    const writeByte = value => {
+      block[blockLength++] = value;
+      if (blockLength === 255) {
+        writer.byte(255);
+        writer.bytes(block);
+        blockLength = 0;
+      }
+    };
+    const writeCode = code => {
+      bitBuffer |= code << bitCount;
+      bitCount += codeSize;
+      while (bitCount >= 8) {
+        writeByte(bitBuffer & 255);
+        bitBuffer >>>= 8;
+        bitCount -= 8;
+      }
+    };
+    const pixelAt = index => {
+      const x = index % width;
+      const y = (index - x) / width;
+      const source = (top + y) * this.width + left + x;
+      return pixels[source];
+    };
+
+    writeCode(clearCode);
+    const pixelCount = width * height;
+    let prefix = pixelAt(0);
+    for (let index = 1; index < pixelCount; index++) {
+      const value = pixelAt(index);
+      const key = (prefix << 8) | value;
+      const found = dictionary.get(key);
+      if (found !== undefined) {
+        prefix = found;
+        continue;
+      }
+      writeCode(prefix);
+      if (nextCode < 4096) {
+        dictionary.set(key, nextCode++);
+        if (nextCode === (1 << codeSize) + 1 && codeSize < 12) codeSize++;
+      } else {
+        writeCode(clearCode);
+        dictionary.clear();
+        nextCode = 130;
+        codeSize = 8;
+      }
+      prefix = value;
+    }
+    writeCode(prefix);
+    writeCode(endCode);
+    if (bitCount) writeByte(bitBuffer & 255);
+    if (blockLength) {
+      writer.byte(blockLength);
+      writer.bytes(block.subarray(0, blockLength));
+    }
+    writer.byte(0);
+  }
+
+  finish() {
+    this.writer.byte(0x3b);
+    return this.writer.blob();
+  }
+}
+
+function indexedFrame(imageData, previous) {
+  const rgba = imageData.data;
+  const lookup = getGifLookup();
+  const pixels = new Uint8Array(imageData.width * imageData.height);
+  const patch = new Uint8Array(pixels.length);
+  if (previous) patch.fill(GIF_TRANSPARENT);
+  let left = imageData.width;
+  let top = imageData.height;
+  let right = -1;
+  let bottom = -1;
+  for (let index = 0; index < pixels.length; index++) {
+    const offset = index * 4;
+    const key = ((rgba[offset] >> 3) << 10) |
+        ((rgba[offset + 1] >> 3) << 5) |
+        (rgba[offset + 2] >> 3);
+    const value = lookup[key];
+    pixels[index] = value;
+    if (previous && value === previous[index]) continue;
+    patch[index] = value;
+    const x = index % imageData.width;
+    const y = (index - x) / imageData.width;
+    left = Math.min(left, x);
+    top = Math.min(top, y);
+    right = Math.max(right, x);
+    bottom = Math.max(bottom, y);
+  }
+  if (right < left) return {pixels, patch, left: 0, top: 0, width: 1, height: 1};
+  return {pixels, patch, left, top, width: right - left + 1, height: bottom - top + 1};
+}
+
+function gifPlan(scale) {
+  if (!intervalCount) return [{position: 0, delay: 10}];
+  const frames = [];
+  const nominal = Math.max(2, Math.round(data.secondsPerTick * 20));
+  for (let interval = 0; interval < intervalCount; interval++) {
+    const payload = data.ticks[interval].interval;
+    const values = decodePoints(payload.points);
+    let maximumMotion = 0;
+    let needsFade = false;
+    for (const [detectorId, flags, offset, count] of payload.records) {
+      if ((flags & STYLE_CHANGED) || !(flags & HAS_SOURCE) || !(flags & HAS_TARGET)) {
+        needsFade = true;
+      }
+      const targetOffset = offset + count * 2;
+      for (let point = 0; point < count; point++) {
+        const source = offset + point * 2;
+        const target = targetOffset + point * 2;
+        const dx = values[target] - values[source];
+        const dy = values[target + 1] - values[source + 1];
+        maximumMotion = Math.max(maximumMotion, Math.hypot(dx, dy) * scale);
+      }
+    }
+    const totalDelay = Math.max(2, Math.round(data.secondsPerTick * 100));
+    let steps = needsFade ? nominal : Math.max(2, Math.ceil(maximumMotion / 2));
+    steps = Math.min(nominal, totalDelay, steps);
+    const baseDelay = Math.floor(totalDelay / steps);
+    let remainder = totalDelay - baseDelay * steps;
+    for (let step = 0; step < steps; step++) {
+      frames.push({
+        position: interval + step / steps,
+        delay: baseDelay + (remainder-- > 0 ? 1 : 0),
+      });
+    }
+  }
+  frames.push({position: intervalCount, delay: 4});
+  return frames;
+}
+
+async function drawSvg(context, svg, width, height) {
+  const copy = svg.cloneNode(true);
+  copy.setAttribute('width', String(width));
+  copy.setAttribute('height', String(height));
+  const source = new XMLSerializer().serializeToString(copy);
+  const url = URL.createObjectURL(new Blob([source], {type: 'image/svg+xml'}));
+  const image = new Image();
+  image.src = url;
+  try {
+    await image.decode();
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.fillStyle = 'white';
+  context.fillRect(0, 0, width, height);
+  context.drawImage(image, 0, 0, width, height);
+}
+
+async function saveGif() {
+  const exportStarted = performance.now();
+  const originalPosition = position;
+  const resume = playing;
+  playing = false;
+  playButton.textContent = 'Play';
+  gifButton.disabled = true;
+  try {
+    show(0);
+    const svg = stage.querySelector('svg');
+    const box = svg.viewBox.baseVal;
+    const width = Math.max(480, Math.min(720, Math.round(box.width)));
+    const height = Math.max(1, Math.round(width * box.height / box.width));
+    const plan = gifPlan(width / box.width);
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext('2d', {alpha: false, willReadFrequently: true});
+    const encoder = new GifEncoder(width, height);
+    let previous = null;
+    for (let index = 0; index < plan.length; index++) {
+      show(plan[index].position);
+      await drawSvg(context, stage.querySelector('svg'), width, height);
+      const frame = indexedFrame(context.getImageData(0, 0, width, height), previous);
+      encoder.frame(
+          frame.patch, frame.left, frame.top, frame.width, frame.height, plan[index].delay);
+      previous = frame.pixels;
+      if (index % 8 === 7 || index + 1 === plan.length) {
+        gifButton.textContent = `Saving ${Math.round((index + 1) * 100 / plan.length)}%`;
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+    }
+    const blob = encoder.finish();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `dynamic_detection_regions_${data.startTick}-${data.startTick + intervalCount}.gif`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    gifButton.dataset.lastBytes = String(blob.size);
+    gifButton.dataset.lastMilliseconds = String(performance.now() - exportStarted);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (error) {
+    console.error(error);
+    alert(`GIF export failed: ${error.message || error}`);
+  } finally {
+    show(originalPosition);
+    gifButton.textContent = 'Save GIF';
+    gifButton.disabled = false;
+    playing = resume && intervalCount > 0;
+    playButton.textContent = playing ? 'Pause' : 'Play';
+    previousFrameTime = 0;
+    if (playing) requestAnimationFrame(animate);
+  }
+}
+
 function animate(now) {
   if (!playing) return;
   if (!previousFrameTime) previousFrameTime = now;
@@ -411,6 +774,8 @@ seek.oninput = () => {
   playButton.textContent = 'Play';
   show(Number(seek.value));
 };
+
+gifButton.onclick = saveGif;
 
 playButton.disabled = intervalCount === 0;
 playButton.textContent = playing ? 'Pause' : 'Play';

@@ -26,6 +26,9 @@ animation = dynamic_detection_regions(circuit)
 animation.save("animation.html")
 ```
 
+Click **Save GIF** in the player to render and download a compact looping GIF
+entirely in memory, without saving HTML or temporary frames.
+
 For a smaller part of a large circuit, use Stim's half-open tick-range style:
 
 ```python
